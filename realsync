@@ -42,6 +42,7 @@ my @RSYNC_SSH_WRAPPER = ();
 my %CONFIG;
 my $REM_SCRIPT = get_remote_script();
 my $SSH_PID;
+my $REMOTE_NOTIFY_PID;
 my @TREE;
 my $IN_REPLICATION = 0;
 my $HOOKS = ($ENV{COMSPEC} && 'Realsync::Win32') || ($^O =~ /darwin/i && 'Realsync::Darwin') || 'Realsync::Generic';
@@ -116,6 +117,7 @@ sub mainloop {
 	$IN_REPLICATION = 1;
 
 	spawn_notify_daemon();
+
 	$HOOKS->init_gui();
 
 	while (1) {
@@ -133,7 +135,9 @@ sub onexit {
 	my ($iteration_end) = @_;
 	if ($IN_REPLICATION) {
 		kill(9, $SSH_PID) if $SSH_PID;
+		kill(15, $REMOTE_NOTIFY_PID) if $REMOTE_NOTIFY_PID;
 		$SSH_PID = undef;
+		$REMOTE_NOTIFY_PID = undef;
 		notification("wait");
 	}
 	if (!$iteration_end) {
@@ -195,7 +199,11 @@ sub do_replication {
 	my $num_objs = grep { $_->{type} eq "dir" } get_changes();
 
 	# Initial rsync.
-	do_rsync("Fast initial rsync synchronization...") if !$DEBUG_PATCH_TREE;
+	do_rsync("Fast initial rsync synchronization...", 1) if !$DEBUG_PATCH_TREE;
+
+	if (cfg("bidirectional", 1) eq "y") {
+		do_run_remote_notify("Initializing background remote FS monitoring utility...");
+	}
 
 	# Watching.
 	logger("", 0, 1);
@@ -207,16 +215,59 @@ sub do_replication {
 # Executes RSYNC command.
 #
 sub do_rsync {
-	my ($msg) = @_;
+
+	my ($msg, $first_time) = @_;
+
+	my $variant = "1";
+
+	if ($first_time and cfg("bidirectional", 1) eq "y") {
+		print "You have bidirectional support turned on\n";
+		print "There are three options on initial synchronization:\n";
+		print " 1. local -> remote (remote will become copy of local)\n";
+		print " 2. remote -> local (local will become copy of remote)\n";
+		print " 3. Do not perform initial synchronization (only new files from this moment will be synced)\n";
+
+		$variant = ask(
+			"Which option do you choose?",
+			"1",
+			sub { $_ ne "1" && $_ ne "2" && $_ ne "3" ? "choose option 1-3" : undef }
+		);
+	}
+	
+	my $local    = $HOOKS->convert_rsync_local_path(cfg("local")) . "/"; # the trailing slash is significant!
+	my $remote   = cfg("user") . '@' . cfg("host") . ":" . cfg("remote") . "/";
+	
+	my $from = undef;
+	my $to   = undef;
+
+	if ($variant == 1) {
+
+		$from = $local;
+		$to = $remote;
+
+	} elsif ($variant == 2) {
+
+		$from = $remote;
+		$to = $local;
+
+	} elsif ($variant == 3) {
+
+		return;
+
+	} else {
+		die "Unknown variant $variant for initial sync";
+	}
+
 	my @rsync_cmd = (
 		@RSYNC_WRAPPER,
 		"rsync", 
 		"-e", join(" ", @RSYNC_SSH_WRAPPER, "ssh", (-f $FILE_IDENTITY? ("-i", $FILE_IDENTITY) : ()), @SSH_OPTIONS), 
 		@RSYNC_OPTIONS,
-		$HOOKS->convert_rsync_local_path(cfg("local")) . "/", # the trailing slash is significant!
-		cfg("user") . '@' . cfg("host") . ":" . cfg("remote") . "/",
+		$from, 
+		$to,
 		map { ("--exclude", $_) } @{cfg("exclude", 1)},
 	);
+	
 	notification("rsync");
 	while (1) {
 		logger($msg);
@@ -237,6 +288,34 @@ sub do_rsync {
 	notification("wait");
 }
 
+sub do_run_remote_notify {
+	
+	my ($msg) = @_;
+	logger($msg);
+
+	my $perl_code = '
+use Cwd qw(getcwd);
+	';
+
+	my $remote_cmd = "
+	perl -we '$perl_code'
+	";
+
+	print $remote_cmd;
+	die;
+
+	my @ssh_cmd = (
+		"ssh", 
+		($SSH_VERBOSE? ("-v") : ()), 
+		(-f $FILE_IDENTITY? ("-i", $FILE_IDENTITY) : ()),
+		@SSH_OPTIONS,
+		cfg("user") . '@' . cfg("host"), 
+		".realsync-support/notify watch '".cfg("remote")."' 2>&1" 
+	);
+
+	$REMOTE_NOTIFY_PID = open2(">&STDOUT", \*REMOTE_NOTIFY_IN, @ssh_cmd) or die "Cannot run remote_notify: $!\n";
+
+}
 
 #
 # Executes background SSH process which is used to push changes.
@@ -292,6 +371,9 @@ sub do_watch {
 	}
 }
 
+sub ssh_identity_option {
+	return (-f $FILE_IDENTITY? "-i $FILE_IDENTITY" : "");
+}
 
 #
 # Performs installation process.
@@ -300,7 +382,7 @@ sub do_install {
 	local $SIG{CHLD}; # else system() does not work
 
 	my $step_num = 1;
-	my $step_max = 6;
+	my $step_max = 7;
 	my $step_text = sub {
 		my $s = "(Step $step_num/$step_max) $_[0]";
 		$step_num++;
@@ -331,7 +413,7 @@ sub do_install {
 	mkpath($DIR_PRIVATE, 0, 0700);
 
 	my $host = undef;
-	my $user = undef;
+	my $user = $ENV{USER} || undef;
 	my $step_save = $step_num;
 	while (1) {
 		$step_num = $step_save;
@@ -343,7 +425,7 @@ sub do_install {
 				$host, 
 				sub { /^[-\w.]+$/s ? undef : "Invalid hostname!" } 
 			)),
-			"comment" => "Remote host to replicate to over SSH.",
+			"comment" => "Remote host (or alias) to replicate to over SSH.",
 		};
 
 		push @config, {
@@ -357,40 +439,86 @@ sub do_install {
 		};
 		
 		# Check if we have already passwordless access.
-		print "   checking if we have access without a password to this host...\n";
+		print "   checking if we have access to $user\@$host without password...\n";
 		my $cmd = "ssh -q -o PasswordAuthentication=no -o StrictHostKeyChecking=no $user\@$host exit";
-		last if system($cmd) == 0;
+		if (system($cmd) == 0) {
+			print "   skipping step $step_num as you already have passwordless access\n";
+			$step_num++;
+		} else {
+			# Use a custom SSH key (create a new one if no key exists).
+			mkpath(dirname($FILE_IDENTITY), 0, 0700);
+			if (!-f $FILE_IDENTITY) {
+				my $cmd = "ssh-keygen -N \"\" -q -t rsa -b 2048 -f $FILE_IDENTITY";
+				if (system($cmd)) {
+					die "Cannot generate SSH keys. ssh-keygen: $!\n$cmd\n";
+				}
+			}
+			
+			# For users who ask: "should I enter my password each time?"
+			ask($step_text->("ONLY ONCE you will be asked for a password. Continue?"), "y");
+			my $pub_file = "$FILE_IDENTITY.pub";
+			
+			# system() is better than popen(), because Perl does not flush a child
+			# process'es STDERR till we read from STDIN (Win32 perl bug?).
+			print "Copying SSH key to $user\@$host. Executing:\n";
+			$cmd = 
+				'ssh -o StrictHostKeyChecking=no ' . $user . '@' . $host . "\n" .
+				'  "cd; umask 077; test -d .ssh || mkdir .ssh; (echo; cat) >> .ssh/authorized_keys"';
+			my $show = '$ ' . $cmd;
+			print "$show\n";
+			$cmd =~ s/\s*\n\s*/ /sg;
+			if (system("$cmd < $pub_file")) {
+				print STDERR "\n";
+				print STDERR "Failed connecting to $user\@$host. Please enter a correct host, login and password.\n";
+				print STDERR "\n";
+				next;
+			}
+			print "Public key $pub_file is copied to $user\@$host!\n";
+			print "\n";
+		}
 		
-		# Use a custom SSH key (create a new one if no key exists).
-		mkpath(dirname($FILE_IDENTITY), 0, 0700);
-		if (!-f $FILE_IDENTITY) {
-			my $cmd = "ssh-keygen -N \"\" -q -t rsa -b 2048 -f $FILE_IDENTITY";
-			if (system($cmd)) {
-				die "Cannot generate SSH keys. ssh-keygen: $!\n$cmd\n";
+		push @config, {
+			"name"    => "bidirectional",
+			"value"   => (my $bidirectional = ask(
+				$step_text->("Would you like to use bidirectional synchronization?"), 
+				'y',
+				sub { $_ eq 'y' || $_ eq 'n' ? undef : "Please choose yes (y) or no (n)" }
+			)),
+			"comment" => "Local directory to be realtime-replicated.",
+		};
+
+		if ($bidirectional eq "y") {
+			print "   checking if remote side has supported OS for bidirectional sync\n";
+
+			my $cmd_prefix = "ssh " . ssh_identity_option() . " -o StrictHostKeyChecking=no " . $user . '@' . $host;
+			$cmd = $cmd_prefix . " uname";
+
+			my $remote_uname = `$cmd`;
+			$remote_uname =~ s/^\s+|\s+$//;
+
+			# the only supported remote OS at the moment is Linux
+			if ($remote_uname eq "Linux") {
+				print "   copying notification utility to ~/.realsync-support/notify...\n";
+				# we do not have scp utility under Windows version, so use the following command instead
+				$cmd =
+					$cmd_prefix .
+					" 'test -d .realsync-support || mkdir .realsync-support; cat >.realsync-support/notify && chmod +x .realsync-support/notify' <" .
+					$BINDIR."/bin/linux/notify";
+				
+				if (system($cmd)) {
+					print STDERR "Failed to copy linux notification utility\n";
+					print STDERR "Please fix errors displayed above and try again\n";
+					next;
+				}
+				
+
+			} else {
+				print STDERR "   sorry, $remote_uname is not currently supported as remote OS\n";
+				print STDERR "   feel free to fork the project at github and add support for $remote_uname if you want\n";
+				next;
 			}
 		}
 		
-		# For users who ask: "should I enter my password each time?"
-		ask($step_text->("ONLY ONCE you will be asked for a password. Continue?"), "y");
-		my $pub_file = "$FILE_IDENTITY.pub";
-		
-		# system() is better than popen(), because Perl does not flush a child
-		# process'es STDERR till we read from STDIN (Win32 perl bug?).
-		print "Copying SSH key to $user\@$host. Executing:\n";
-		my $cmd = 
-			'ssh -o StrictHostKeyChecking=no ' . $user . '@' . $host . "\n" .
-			'  "cd; umask 077; test -d .ssh || mkdir .ssh; (echo; cat) >> .ssh/authorized_keys"';
-		my $show = '$ ' . $cmd;
-		print "$show\n";
-		$cmd =~ s/\s*\n\s*/ /sg;
-		if (system("$cmd < $pub_file")) {
-			print STDERR "\n";
-			print STDERR "Failed connecting to $user\@$host. Please enter a correct host, login and password.\n";
-			print STDERR "\n";
-			next;
-		}
-		print "Public key $pub_file is copied to $user\@$host!\n";
-		print "\n";
 		
 		last;
 	}
@@ -402,7 +530,7 @@ sub do_install {
 			undef,
 			sub {
 				print "   checking if the directory exists...\n";
-				my $cmd = "ssh " . (-f $FILE_IDENTITY? "-i $FILE_IDENTITY" : "") . " -o StrictHostKeyChecking=no " . $user . '@' . $host . ' "test -d ' . $_ . '"';
+				my $cmd = "ssh " . ssh_identity_option() . " -o StrictHostKeyChecking=no " . $user . '@' . $host . ' "test -d ' . $_ . '"';
 				my $ret = system($cmd) >> 8;
 				if ($ret != 0) {
 					return "Directory $_ at $user\@$host does not exist. Try again.";
